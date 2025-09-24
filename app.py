@@ -1,8 +1,9 @@
-import logging
-import json
 import os
+import json
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
 import boto3
 from dotenv import load_dotenv
 
@@ -25,235 +26,228 @@ from livekit.agents.llm import function_tool
 from livekit.agents.voice import MetricsCollectedEvent
 from livekit.plugins import openai, silero
 
+
+# ---------------------------------------------------------
+# Environment + logging setup
+# ---------------------------------------------------------
 load_dotenv()
-logger = logging.getLogger("english-coach")
+logger = logging.getLogger("lingua-trainer")
 
-# AWS S3 Configuration
-S3_BUCKET_NAME = "englishly-reports"
-S3_CLIENT = boto3.client("s3")
+S3_STORAGE = "lingua-feedback-data"
+s3_resource = boto3.client("s3")
 
+
+# ---------------------------------------------------------
+# Learner record
+# ---------------------------------------------------------
 @dataclass
-class LearnerProfile:
-    goal: Optional[str] = None
-    background: Optional[str] = None
-    level: Optional[str] = None
-    scenario: Optional[str] = None
-    strengths: Optional[str] = None
-    areas_to_improve: Optional[str] = None
+class LearnerRecord:
+    purpose: Optional[str] = None
+    occupation: Optional[str] = None
+    estimated_skill: Optional[str] = None
+    practice_topic: Optional[str] = None
+    highlights: Optional[str] = None
+    improvements: Optional[str] = None
 
 
-class AssessmentIntroAgent(Agent):
-    def __init__(self, chat_ctx: Optional[ChatContext] = None) -> None:
+# ---------------------------------------------------------
+# Agents
+# ---------------------------------------------------------
+class GreetingCoach(Agent):
+    """Opens the session and collects learner’s purpose and occupation."""
+
+    def __init__(self, ctx: Optional[ChatContext] = None):
         super().__init__(
             instructions="""
-            Your name is Englishly.
-            You are an English-speaking AI coach. 
-            Start with a friendly introduction.
-            Ask the user about their English learning goal (e.g., job, travel, study).
-            Then ask about their background (e.g., student, doctor, engineer).
-            After collecting both, hand off to the assessment agent.
-            Only speak English. If the user uses another language, gently remind them to use English.
+            You are Lingua, an English conversation guide.
+            Start with a cheerful hello.
+            Ask the learner why they want to practice English (work, studies, travel, etc.).
+            Next, ask about their current role or background.
+            Remind them to keep replies in English.
             """,
-            chat_ctx=chat_ctx
+            chat_ctx=ctx,
         )
 
     async def on_enter(self):
         self.session.generate_reply(allow_interruptions=False)
 
     @function_tool
-    async def set_user_profile(
-        self,
-        context: RunContext[LearnerProfile],
-        goal: str,
-        background: str,
+    async def store_basics(
+        self, ctx: RunContext[LearnerRecord], *, purpose: str, occupation: str
     ):
-        context.userdata.goal = goal
-        context.userdata.background = background
-        logger.info(f"User profile captured: Goal={goal}, Background={background}")
-        return ProficiencyAssessmentAgent(chat_ctx=self.chat_ctx), "Thanks! Let's assess your English level now."
+        ctx.userdata.purpose = purpose
+        ctx.userdata.occupation = occupation
+        logger.info(f"Basics collected: purpose={purpose}, occupation={occupation}")
+        return SkillEvaluator(chat_ctx=self.chat_ctx), "Great! Let's quickly check your English fluency."
 
 
-class ProficiencyAssessmentAgent(Agent):
-    def __init__(self, chat_ctx: Optional[ChatContext] = None) -> None:
+class SkillEvaluator(Agent):
+    """Asks a few test questions to get an estimated skill rating."""
+
+    def __init__(self, ctx: Optional[ChatContext] = None):
         super().__init__(
             instructions="""
-            Ask the user a few simple English questions to evaluate their speaking proficiency.
-            Based on their answers, estimate their proficiency level (out of 100%).
-            Do not explain the levels.
-            When ready, hand off to the ScenarioAgent with the estimated level.
+            Ask 2–3 short English questions to test fluency.
+            Based on answers, assign a skill rating (e.g., 30%, 60%, 90%).
+            Don’t explain what the number means.
+            When ready, send them to practice scenarios.
             """,
-            chat_ctx=chat_ctx
+            chat_ctx=ctx,
         )
 
     async def on_enter(self):
         self.session.generate_reply(allow_interruptions=False)
 
     @function_tool
-    async def set_level(
-        self,
-        context: RunContext[LearnerProfile],
-        level: str,
-    ):
-        context.userdata.level = level
-        return ScenarioAgent(chat_ctx=self.chat_ctx), f"Got it! Your level is estimated at {level}. Let's move on."
+    async def assign_rating(self, ctx: RunContext[LearnerRecord], *, rating: str):
+        ctx.userdata.estimated_skill = rating
+        return ScenarioTrainer(chat_ctx=self.chat_ctx), f"Your level is around {rating}. Let’s practice with a scenario."
 
 
-class ScenarioAgent(Agent):
-    def __init__(self, chat_ctx: Optional[ChatContext] = None) -> None:
+class ScenarioTrainer(Agent):
+    """Conducts roleplay practice."""
+
+    def __init__(self, ctx: Optional[ChatContext] = None):
         super().__init__(
             instructions="""
-            Based on the user's goal and level, pick a suitable practice scenario:
-            - Job interview based on their background
-            - University admission
-            - Business meeting
+            Pick one practice scenario suitable for the learner’s purpose and level:
+            - Interview roleplay
+            - Academic admission talk
+            - Office meeting
             - Travel conversation
-
-            Announce the scenario and start a short roleplay session.
-            Ask 2-3 scenario-based questions.
-            Then, hand off to FeedbackAgent.
+            Explain the scenario and ask 2–3 related questions.
+            Then move to feedback.
             """,
-            chat_ctx=chat_ctx
+            chat_ctx=ctx,
         )
 
     async def on_enter(self):
         self.session.generate_reply(allow_interruptions=False)
 
     @function_tool
-    async def set_scenario(
-        self,
-        context: RunContext[LearnerProfile],
-        scenario: str,
-    ):
-        context.userdata.scenario = scenario
-        return FeedbackAgent(chat_ctx=self.chat_ctx), f"Great! You've completed the {scenario} practice."
+    async def mark_topic(self, ctx: RunContext[LearnerRecord], *, topic: str):
+        ctx.userdata.practice_topic = topic
+        return PerformanceReviewer(chat_ctx=self.chat_ctx), f"Nice job! You’ve finished the {topic} scenario."
 
 
-class FeedbackAgent(Agent):
-    def __init__(self, chat_ctx: Optional[ChatContext] = None) -> None:
+class PerformanceReviewer(Agent):
+    """Provides feedback + generates bilingual report."""
+
+    def __init__(self, ctx: Optional[ChatContext] = None):
         super().__init__(
             instructions="""
-            Provide feedback based on the user's overall performance:
-            - Proficiency score
-            - Strengths
-            - Areas to improve
-
-            Present the report in English and Arabic.
-            After giving the report, say goodbye and end the session.
+            Summarize learner’s performance:
+            - Mention their estimated level
+            - Highlight key strengths
+            - Suggest improvement areas
+            Provide the report in English and Arabic.
+            Wrap up by wishing them success.
             """,
-            chat_ctx=chat_ctx
+            chat_ctx=ctx,
         )
 
     async def on_enter(self):
         self.session.generate_reply(allow_interruptions=False)
 
     @function_tool
-    async def end_session(
-        self, 
-        context: RunContext[LearnerProfile],
-        strengths: str,
-        areas_to_improve: str):
-
+    async def wrap_up(
+        self, ctx: RunContext[LearnerRecord], *, strengths: str, improvements: str
+    ):
         self.session.interrupt()
 
-        # Store feedback in userdata
-        context.userdata.strengths = strengths
-        context.userdata.areas_to_improve = areas_to_improve
-        logger.info(f"[FeedbackAgent] Strengths: {strengths}, Areas to Improve: {areas_to_improve}")
+        ctx.userdata.highlights = strengths
+        ctx.userdata.improvements = improvements
 
-        goal = context.userdata.goal or "N/A"
-        background = context.userdata.background or "N/A"
-        level = context.userdata.level or "N/A"
-        scenario = context.userdata.scenario or "N/A"
-        
-
-        english = {
-            "Goal": goal,
-            "Background": background,
-            "Estimated Level": level,
-            "Scenario Practiced": scenario,
-            "Strengths": strengths,
-            "Areas to Improve": areas_to_improve,
-        }
-
-        arabic = {
-            "الهدف": goal,
-            "الخلفية": background,
-            "المستوى المتوقع": level,
-            "السيناريو": scenario,
-            "نقاط القوة": strengths,
-            "نقاط التحسين": areas_to_improve
-        }
-
-        report = {"english": english, "arabic": arabic}
-
-        # Upload JSON report to S3
-        job_ctx = get_job_context()
-        room_name = job_ctx.room.name
-        filename = f"english_feedback_report_{room_name}.json"
-        
-        try:
-            S3_CLIENT.put_object(
-                Bucket=S3_BUCKET_NAME,
-                Key=filename,
-                Body=json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8"),
-                ContentType="application/json"
-            )
-            logger.info(f"Report uploaded to S3: {filename}")
-        except Exception as e:
-            logger.error(f"Failed to upload report to S3: {e}")
-
-        await self.session.generate_reply(
-            instructions="Say goodbye and wish the learner good luck.",
-            allow_interruptions=False
+        logger.info(
+            f"[PerformanceReviewer] Feedback → strengths={strengths}, improvements={improvements}"
         )
 
-        job_ctx = get_job_context()
-        await job_ctx.api.room.delete_room(api.DeleteRoomRequest(room=job_ctx.room.name))
+        english_summary = {
+            "Purpose": ctx.userdata.purpose or "N/A",
+            "Occupation": ctx.userdata.occupation or "N/A",
+            "Skill Estimate": ctx.userdata.estimated_skill or "N/A",
+            "Scenario Practiced": ctx.userdata.practice_topic or "N/A",
+            "Strengths": strengths,
+            "Areas to Improve": improvements,
+        }
+
+        arabic_summary = {
+            "الهدف": english_summary["Purpose"],
+            "المهنة": english_summary["Occupation"],
+            "المستوى المقدر": english_summary["Skill Estimate"],
+            "المشهد التدريبي": english_summary["Scenario Practiced"],
+            "نقاط القوة": strengths,
+            "نقاط التحسين": improvements,
+        }
+
+        report = {"english": english_summary, "arabic": arabic_summary}
+
+        job = get_job_context()
+        room_id = job.room.name
+        filename = f"lingua_feedback_{room_id}.json"
+
+        try:
+            s3_resource.put_object(
+                Bucket=S3_STORAGE,
+                Key=filename,
+                Body=json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+            logger.info(f"Report successfully uploaded → {filename}")
+        except Exception as ex:
+            logger.error(f"S3 upload error: {ex}")
+
+        await self.session.generate_reply(
+            instructions="Say goodbye warmly and encourage learner.",
+            allow_interruptions=False,
+        )
+
+        await job.api.room.delete_room(api.DeleteRoomRequest(room=room_id))
 
 
-def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+# ---------------------------------------------------------
+# Worker bootstrap
+# ---------------------------------------------------------
+def warmup(proc: JobProcess):
+    proc.userdata["voice_detector"] = silero.VAD.load()
 
 
-async def entrypoint(ctx: JobContext):
+async def main_entry(ctx: JobContext):
     await ctx.connect()
 
-    # Initialize empty ChatContext
-    chat_ctx = ChatContext.empty()
+    chat_state = ChatContext.empty()
+    profile = LearnerRecord()
 
-    session = AgentSession[LearnerProfile](
-        vad=ctx.proc.userdata["vad"],
+    session = AgentSession[LearnerRecord](
+        vad=ctx.proc.userdata["voice_detector"],
         stt=openai.STT.with_azure(
             azure_deployment="gpt-4o-mini-transcribe",
             api_version="2024-02-15-preview",
-            language="en"
+            language="en",
         ),
         llm=openai.LLM.with_azure(
-            azure_deployment="gpt-4o-mini",
-            api_version="2024-02-15-preview"
+            azure_deployment="gpt-4o-mini", api_version="2024-02-15-preview"
         ),
         tts=openai.TTS.with_azure(
-            azure_deployment="gpt-4o-mini-tts",
-            api_version="2024-02-15-preview"
+            azure_deployment="gpt-4o-mini-tts", api_version="2024-02-15-preview"
         ),
-        userdata=LearnerProfile(),
+        userdata=profile,
     )
 
-    usage_collector = metrics.UsageCollector()
+    usage_tracker = metrics.UsageCollector()
 
     @session.on("metrics_collected")
-    def _on_metrics(ev: MetricsCollectedEvent):
+    def collect(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
+        usage_tracker.collect(ev.metrics)
 
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
+    async def report_usage():
+        logger.info(f"Usage summary: {usage_tracker.get_summary()}")
 
-    ctx.add_shutdown_callback(log_usage)
+    ctx.add_shutdown_callback(report_usage)
 
     await session.start(
-        agent=AssessmentIntroAgent(chat_ctx=chat_ctx),
+        agent=GreetingCoach(chat_ctx=chat_state),
         room=ctx.room,
         room_input_options=RoomInputOptions(),
         room_output_options=RoomOutputOptions(transcription_enabled=True),
@@ -261,4 +255,4 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    cli.run_app(WorkerOptions(entrypoint_fnc=main_entry, prewarm_fnc=warmup))
